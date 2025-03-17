@@ -13,6 +13,7 @@
 #include "managers/SeatManager.hpp"
 #include "managers/VersionKeeperManager.hpp"
 #include "managers/DonationNagManager.hpp"
+#include "managers/ANRManager.hpp"
 #include "managers/eventLoop/EventLoopManager.hpp"
 #include <algorithm>
 #include <aquamarine/output/Output.hpp>
@@ -75,6 +76,7 @@
 using namespace Hyprutils::String;
 using namespace Aquamarine;
 using enum NContentType::eContentType;
+using namespace NColorManagement;
 
 static int handleCritSignal(int signo, void* data) {
     Debug::log(LOG, "Hyprland received signal {}", signo);
@@ -592,6 +594,7 @@ void CCompositor::cleanup() {
     g_pEventLoopManager.reset();
     g_pVersionKeeperMgr.reset();
     g_pDonationNagManager.reset();
+    g_pANRManager.reset();
     g_pConfigWatcher.reset();
 
     if (m_pAqBackend)
@@ -693,6 +696,9 @@ void CCompositor::initManagers(eManagersInitStage stage) {
 
             Debug::log(LOG, "Creating the DonationNag!");
             g_pDonationNagManager = makeUnique<CDonationNagManager>();
+
+            Debug::log(LOG, "Creating the ANRManager!");
+            g_pANRManager = makeUnique<CANRManager>();
 
             Debug::log(LOG, "Starting XWayland");
             g_pXWayland = makeUnique<CXWayland>(g_pCompositor->m_bWantsXwayland);
@@ -809,6 +815,11 @@ PHLMONITOR CCompositor::getMonitorFromCursor() {
 }
 
 PHLMONITOR CCompositor::getMonitorFromVector(const Vector2D& point) {
+    if (m_vMonitors.empty()) {
+        Debug::log(WARN, "getMonitorFromVector called with empty monitor list");
+        return nullptr;
+    }
+
     PHLMONITOR mon;
     for (auto const& m : m_vMonitors) {
         if (CBox{m->vecPosition, m->vecSize}.containsPoint(point)) {
@@ -2204,7 +2215,8 @@ void CCompositor::moveWorkspaceToMonitor(PHLWORKSPACE pWorkspace, PHLMONITOR pMo
     // finalize
     if (POLDMON) {
         g_pLayoutManager->getCurrentLayout()->recalculateMonitor(POLDMON->ID);
-        updateFullscreenFadeOnWorkspace(POLDMON->activeWorkspace);
+        if (valid(POLDMON->activeWorkspace))
+            updateFullscreenFadeOnWorkspace(POLDMON->activeWorkspace);
         updateSuspendedStates();
     }
 
@@ -2693,6 +2705,9 @@ void CCompositor::moveWindowToWorkspaceSafe(PHLWINDOW pWindow, PHLWORKSPACE pWor
     if (pWindow->m_bPinned && pWorkspace->m_bIsSpecialWorkspace)
         return;
 
+    if (pWindow->m_pWorkspace == pWorkspace)
+        return;
+
     const bool FULLSCREEN     = pWindow->isFullscreen();
     const auto FULLSCREENMODE = pWindow->m_sFullscreenState.internal;
     const bool WASVISIBLE     = pWindow->m_pWorkspace && pWindow->m_pWorkspace->isVisible();
@@ -3024,8 +3039,10 @@ void CCompositor::onNewMonitor(SP<Aquamarine::IOutput> output) {
     g_pHyprRenderer->damageMonitor(PNEWMONITOR);
     PNEWMONITOR->onMonitorFrame();
 
-    if (PROTO::colorManagement && shouldChangePreferredImageDescription())
-        PROTO::colorManagement->onImagePreferredChanged();
+    if (PROTO::colorManagement && shouldChangePreferredImageDescription()) {
+        Debug::log(ERR, "FIXME: color management protocol is enabled, need a preferred image description id");
+        PROTO::colorManagement->onImagePreferredChanged(0);
+    }
 }
 
 SImageDescription CCompositor::getPreferredImageDescription() {
@@ -3043,34 +3060,53 @@ bool CCompositor::shouldChangePreferredImageDescription() {
     return false;
 }
 
-void CCompositor::ensurePersistentWorkspacesPresent(const std::vector<SWorkspaceRule>& rules) {
+void CCompositor::ensurePersistentWorkspacesPresent(const std::vector<SWorkspaceRule>& rules, PHLWORKSPACE pWorkspace) {
+
     for (const auto& rule : rules) {
         if (!rule.isPersistent)
             continue;
 
+        PHLWORKSPACE PWORKSPACE = nullptr;
+        if (pWorkspace) {
+            if (pWorkspace->matchesStaticSelector(rule.workspaceString))
+                PWORKSPACE = pWorkspace;
+            else
+                continue;
+        }
+
         const auto PMONITOR = getMonitorFromString(rule.monitor);
+
+        if (!PWORKSPACE) {
+            WORKSPACEID id     = rule.workspaceId;
+            std::string wsname = rule.workspaceName;
+
+            if (id == WORKSPACE_INVALID) {
+                const auto R = getWorkspaceIDNameFromString(rule.workspaceString);
+                id           = R.id;
+                wsname       = R.name;
+            }
+
+            if (id == WORKSPACE_INVALID) {
+                Debug::log(ERR, "ensurePersistentWorkspacesPresent: couldn't resolve id for workspace {}", rule.workspaceString);
+                continue;
+            }
+            PWORKSPACE = getWorkspaceByID(id);
+            if (!PWORKSPACE)
+                createNewWorkspace(id, PMONITOR ? PMONITOR : m_pLastMonitor.lock(), wsname, false);
+        }
+
+        if (PWORKSPACE)
+            PWORKSPACE->m_bPersistent = true;
 
         if (!PMONITOR) {
             Debug::log(ERR, "ensurePersistentWorkspacesPresent: couldn't resolve monitor for {}, skipping", rule.monitor);
             continue;
         }
 
-        WORKSPACEID id     = rule.workspaceId;
-        std::string wsname = rule.workspaceName;
-        if (id == WORKSPACE_INVALID) {
-            const auto R = getWorkspaceIDNameFromString(rule.workspaceString);
-            id           = R.id;
-            wsname       = R.name;
-        }
-
-        if (id == WORKSPACE_INVALID) {
-            Debug::log(ERR, "ensurePersistentWorkspacesPresent: couldn't resolve id for workspace {}", rule.workspaceString);
-            continue;
-        }
-
-        if (const auto PWORKSPACE = getWorkspaceByID(id); PWORKSPACE) {
+        if (PWORKSPACE) {
             if (PWORKSPACE->m_pMonitor == PMONITOR) {
                 Debug::log(LOG, "ensurePersistentWorkspacesPresent: workspace persistent {} already on {}", rule.workspaceString, PMONITOR->szName);
+
                 continue;
             }
 
@@ -3078,8 +3114,6 @@ void CCompositor::ensurePersistentWorkspacesPresent(const std::vector<SWorkspace
             moveWorkspaceToMonitor(PWORKSPACE, PMONITOR);
             continue;
         }
-
-        createNewWorkspace(id, PMONITOR ? PMONITOR : m_pLastMonitor.lock(), wsname, false);
     }
 
     // cleanup old

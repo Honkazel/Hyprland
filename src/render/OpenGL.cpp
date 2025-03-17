@@ -9,6 +9,7 @@
 #include "../desktop/LayerSurface.hpp"
 #include "../protocols/LayerShell.hpp"
 #include "../protocols/core/Compositor.hpp"
+#include "../protocols/ColorManagement.hpp"
 #include "../managers/HookSystemManager.hpp"
 #include "../managers/input/InputManager.hpp"
 #include "pass/TexPassElement.hpp"
@@ -20,6 +21,7 @@
 #include <gbm.h>
 #include <filesystem>
 using namespace Hyprutils::OS;
+using namespace NColorManagement;
 
 const std::vector<const char*> ASSET_PATHS = {
 #ifdef DATAROOTDIR
@@ -595,9 +597,8 @@ GLuint CHyprOpenGLImpl::createProgram(const std::string& vert, const std::string
     if (dynamic) {
         if (fragCompiled == 0)
             return 0;
-    } else {
+    } else
         RASSERT(fragCompiled, "Compiling shader failed. FRAGMENT nullptr! Shader source:\n\n{}", frag);
-    }
 
     auto prog = glCreateProgram();
     glAttachShader(prog, vertCompiled);
@@ -865,6 +866,45 @@ void CHyprOpenGLImpl::initShaders() {
     m_RenderData.pCurrentMonData->m_shQUAD.fullSize      = glGetUniformLocation(prog, "fullSize");
     m_RenderData.pCurrentMonData->m_shQUAD.radius        = glGetUniformLocation(prog, "radius");
     m_RenderData.pCurrentMonData->m_shQUAD.roundingPower = glGetUniformLocation(prog, "roundingPower");
+
+#ifndef GLES2
+    prog           = createProgram(TEXVERTSRC320, TEXFRAGSRCCM, true);
+    m_bCMSupported = prog > 0;
+    if (m_bCMSupported) {
+        m_RenderData.pCurrentMonData->m_shCM.program           = prog;
+        m_RenderData.pCurrentMonData->m_shCM.proj              = glGetUniformLocation(prog, "proj");
+        m_RenderData.pCurrentMonData->m_shCM.tex               = glGetUniformLocation(prog, "tex");
+        m_RenderData.pCurrentMonData->m_shCM.texType           = glGetUniformLocation(prog, "texType");
+        m_RenderData.pCurrentMonData->m_shCM.sourceTF          = glGetUniformLocation(prog, "sourceTF");
+        m_RenderData.pCurrentMonData->m_shCM.targetTF          = glGetUniformLocation(prog, "targetTF");
+        m_RenderData.pCurrentMonData->m_shCM.sourcePrimaries   = glGetUniformLocation(prog, "sourcePrimaries");
+        m_RenderData.pCurrentMonData->m_shCM.targetPrimaries   = glGetUniformLocation(prog, "targetPrimaries");
+        m_RenderData.pCurrentMonData->m_shCM.maxLuminance      = glGetUniformLocation(prog, "maxLuminance");
+        m_RenderData.pCurrentMonData->m_shCM.dstMaxLuminance   = glGetUniformLocation(prog, "dstMaxLuminance");
+        m_RenderData.pCurrentMonData->m_shCM.dstRefLuminance   = glGetUniformLocation(prog, "dstRefLuminance");
+        m_RenderData.pCurrentMonData->m_shCM.sdrSaturation     = glGetUniformLocation(prog, "sdrSaturation");
+        m_RenderData.pCurrentMonData->m_shCM.sdrBrightness     = glGetUniformLocation(prog, "sdrBrightnessMultiplier");
+        m_RenderData.pCurrentMonData->m_shCM.alphaMatte        = glGetUniformLocation(prog, "texMatte");
+        m_RenderData.pCurrentMonData->m_shCM.alpha             = glGetUniformLocation(prog, "alpha");
+        m_RenderData.pCurrentMonData->m_shCM.texAttrib         = glGetAttribLocation(prog, "texcoord");
+        m_RenderData.pCurrentMonData->m_shCM.matteTexAttrib    = glGetAttribLocation(prog, "texcoordMatte");
+        m_RenderData.pCurrentMonData->m_shCM.posAttrib         = glGetAttribLocation(prog, "pos");
+        m_RenderData.pCurrentMonData->m_shCM.discardOpaque     = glGetUniformLocation(prog, "discardOpaque");
+        m_RenderData.pCurrentMonData->m_shCM.discardAlpha      = glGetUniformLocation(prog, "discardAlpha");
+        m_RenderData.pCurrentMonData->m_shCM.discardAlphaValue = glGetUniformLocation(prog, "discardAlphaValue");
+        m_RenderData.pCurrentMonData->m_shCM.topLeft           = glGetUniformLocation(prog, "topLeft");
+        m_RenderData.pCurrentMonData->m_shCM.fullSize          = glGetUniformLocation(prog, "fullSize");
+        m_RenderData.pCurrentMonData->m_shCM.radius            = glGetUniformLocation(prog, "radius");
+        m_RenderData.pCurrentMonData->m_shCM.roundingPower     = glGetUniformLocation(prog, "roundingPower");
+        m_RenderData.pCurrentMonData->m_shCM.applyTint         = glGetUniformLocation(prog, "applyTint");
+        m_RenderData.pCurrentMonData->m_shCM.tint              = glGetUniformLocation(prog, "tint");
+        m_RenderData.pCurrentMonData->m_shCM.useAlphaMatte     = glGetUniformLocation(prog, "useAlphaMatte");
+    } else {
+        Debug::log(
+            ERR,
+            "WARNING: CM Shader failed compiling, color management will not work. It's likely because your GPU is an old piece of garbage, don't file bug reports about this!");
+    }
+#endif
 
     prog                                                     = createProgram(TEXVERTSRC, TEXFRAGSRCRGBA);
     m_RenderData.pCurrentMonData->m_shRGBA.program           = prog;
@@ -1257,16 +1297,16 @@ void CHyprOpenGLImpl::renderTexture(SP<CTexture> tex, const CBox& box, float alp
 }
 
 void CHyprOpenGLImpl::renderTextureWithDamage(SP<CTexture> tex, const CBox& box, const CRegion& damage, float alpha, int round, float roundingPower, bool discardActive,
-                                              bool allowCustomUV, SP<CSyncTimeline> waitTimeline, uint64_t waitPoint) {
+                                              bool allowCustomUV) {
     RASSERT(m_RenderData.pMonitor, "Tried to render texture without begin()!");
 
-    renderTextureInternalWithDamage(tex, box, alpha, damage, round, roundingPower, discardActive, false, allowCustomUV, true, waitTimeline, waitPoint);
+    renderTextureInternalWithDamage(tex, box, alpha, damage, round, roundingPower, discardActive, false, allowCustomUV, true);
 
     scissor(nullptr);
 }
 
 void CHyprOpenGLImpl::renderTextureInternalWithDamage(SP<CTexture> tex, const CBox& box, float alpha, const CRegion& damage, int round, float roundingPower, bool discardActive,
-                                                      bool noAA, bool allowCustomUV, bool allowDim, SP<CSyncTimeline> waitTimeline, uint64_t waitPoint) {
+                                                      bool noAA, bool allowCustomUV, bool allowDim) {
     RASSERT(m_RenderData.pMonitor, "Tried to render texture without begin()!");
     RASSERT((tex->m_iTexID > 0), "Attempted to draw nullptr texture!");
 
@@ -1280,7 +1320,8 @@ void CHyprOpenGLImpl::renderTextureInternalWithDamage(SP<CTexture> tex, const CB
     CBox newBox = box;
     m_RenderData.renderModif.applyToBox(newBox);
 
-    static auto PDT = CConfigValue<Hyprlang::INT>("debug:damage_tracking");
+    static auto PDT   = CConfigValue<Hyprlang::INT>("debug:damage_tracking");
+    static auto PPASS = CConfigValue<Hyprlang::INT>("render:cm_fs_passthrough");
 
     // get the needed transform for this texture
     const bool TRANSFORMS_MATCH = wlTransformToHyprutils(m_RenderData.pMonitor->transform) == tex->m_eTransform; // FIXME: combine them properly!!!
@@ -1288,21 +1329,16 @@ void CHyprOpenGLImpl::renderTextureInternalWithDamage(SP<CTexture> tex, const CB
     if (m_bEndFrame || TRANSFORMS_MATCH)
         TRANSFORM = wlTransformToHyprutils(invertTransform(m_RenderData.pMonitor->transform));
 
-    Mat3x3 matrix   = m_RenderData.monitorProjection.projectBox(newBox, TRANSFORM, newBox.rot);
-    Mat3x3 glMatrix = m_RenderData.projection.copy().multiply(matrix);
-
-    if (waitTimeline != nullptr) {
-        if (!waitForTimelinePoint(waitTimeline, waitPoint)) {
-            Debug::log(ERR, "renderTextureInternalWithDamage: failed to wait for explicit sync point {}", waitPoint);
-            return;
-        }
-    }
+    Mat3x3     matrix   = m_RenderData.monitorProjection.projectBox(newBox, TRANSFORM, newBox.rot);
+    Mat3x3     glMatrix = m_RenderData.projection.copy().multiply(matrix);
 
     CShader*   shader = nullptr;
 
     bool       usingFinalShader = false;
 
     const bool CRASHING = m_bApplyFinalShader && g_pHyprRenderer->m_bCrashingInProgress;
+
+    auto       texType = tex->m_iType;
 
     if (CRASHING) {
         shader           = &m_RenderData.pCurrentMonData->m_shGLITCH;
@@ -1318,14 +1354,15 @@ void CHyprOpenGLImpl::renderTextureInternalWithDamage(SP<CTexture> tex, const CB
             switch (tex->m_iType) {
                 case TEXTURE_RGBA: shader = &m_RenderData.pCurrentMonData->m_shRGBA; break;
                 case TEXTURE_RGBX: shader = &m_RenderData.pCurrentMonData->m_shRGBX; break;
-                case TEXTURE_EXTERNAL: shader = &m_RenderData.pCurrentMonData->m_shEXT; break;
+
+                case TEXTURE_EXTERNAL: shader = &m_RenderData.pCurrentMonData->m_shEXT; break; // might be unused
                 default: RASSERT(false, "tex->m_iTarget unsupported!");
             }
         }
     }
 
     if (m_RenderData.currentWindow && m_RenderData.currentWindow->m_sWindowData.RGBX.valueOrDefault())
-        shader = &m_RenderData.pCurrentMonData->m_shRGBX;
+        texType = TEXTURE_RGBX;
 
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(tex->m_iTarget, tex->m_iTexID);
@@ -1341,7 +1378,53 @@ void CHyprOpenGLImpl::renderTextureInternalWithDamage(SP<CTexture> tex, const CB
         glTexParameteri(tex->m_iTarget, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     }
 
+    const bool skipCM = !m_RenderData.surface /* No surface - no point in CM */
+        || !m_bCMSupported                    /* CM unsupported - hw failed to compile the shader probably */
+        || (*PPASS && m_RenderData.pMonitor->activeWorkspace && m_RenderData.pMonitor->activeWorkspace->m_bHasFullscreenWindow &&
+            m_RenderData.pMonitor->activeWorkspace->m_efFullscreenMode == FSMODE_FULLSCREEN) /* Fullscreen window with pass cm enabled */;
+
     glUseProgram(shader->program);
+
+#ifndef GLES2
+    if (!skipCM && !usingFinalShader && (texType == TEXTURE_RGBA || texType == TEXTURE_RGBX)) {
+        shader = &m_RenderData.pCurrentMonData->m_shCM;
+        glUseProgram(shader->program);
+        glUniform1i(shader->texType, texType);
+        const auto imageDescription =
+            m_RenderData.surface.valid() && m_RenderData.surface->colorManagement.valid() ? m_RenderData.surface->colorManagement->imageDescription() : SImageDescription{};
+        glUniform1i(shader->sourceTF, imageDescription.transferFunction);
+        glUniform1i(shader->targetTF, m_RenderData.pMonitor->imageDescription.transferFunction);
+        const auto sourcePrimaries =
+            imageDescription.primariesNameSet || imageDescription.primaries == SPCPRimaries{} ? getPrimaries(imageDescription.primariesNamed) : imageDescription.primaries;
+        const auto    targetPrimaries = m_RenderData.pMonitor->imageDescription.primariesNameSet || m_RenderData.pMonitor->imageDescription.primaries == SPCPRimaries{} ?
+               getPrimaries(m_RenderData.pMonitor->imageDescription.primariesNamed) :
+               m_RenderData.pMonitor->imageDescription.primaries;
+
+        const GLfloat glSourcePrimaries[8] = {
+            sourcePrimaries.red.x,  sourcePrimaries.red.y,  sourcePrimaries.green.x, sourcePrimaries.green.y,
+            sourcePrimaries.blue.x, sourcePrimaries.blue.y, sourcePrimaries.white.x, sourcePrimaries.white.y,
+        };
+        const GLfloat glTargetPrimaries[8] = {
+            targetPrimaries.red.x,  targetPrimaries.red.y,  targetPrimaries.green.x, targetPrimaries.green.y,
+            targetPrimaries.blue.x, targetPrimaries.blue.y, targetPrimaries.white.x, targetPrimaries.white.y,
+        };
+        glUniformMatrix4x2fv(shader->sourcePrimaries, 1, false, glSourcePrimaries);
+        glUniformMatrix4x2fv(shader->targetPrimaries, 1, false, glTargetPrimaries);
+
+        const float maxLuminance = imageDescription.luminances.max > 0 ? imageDescription.luminances.max : imageDescription.luminances.reference;
+        glUniform1f(shader->maxLuminance, maxLuminance * m_RenderData.pMonitor->imageDescription.luminances.reference / imageDescription.luminances.reference);
+        glUniform1f(shader->dstMaxLuminance, m_RenderData.pMonitor->imageDescription.luminances.max > 0 ? m_RenderData.pMonitor->imageDescription.luminances.max : 10000);
+        glUniform1f(shader->dstRefLuminance, m_RenderData.pMonitor->imageDescription.luminances.reference);
+        glUniform1f(shader->sdrSaturation,
+                    m_RenderData.pMonitor->sdrSaturation > 0 && m_RenderData.pMonitor->imageDescription.transferFunction == NColorManagement::CM_TRANSFER_FUNCTION_ST2084_PQ ?
+                        m_RenderData.pMonitor->sdrSaturation :
+                        1.0f);
+        glUniform1f(shader->sdrBrightness,
+                    m_RenderData.pMonitor->sdrBrightness > 0 && m_RenderData.pMonitor->imageDescription.transferFunction == NColorManagement::CM_TRANSFER_FUNCTION_ST2084_PQ ?
+                        m_RenderData.pMonitor->sdrBrightness :
+                        1.0f);
+    }
+#endif
 
 #ifndef GLES2
     glUniformMatrix3fv(shader->proj, 1, GL_TRUE, glMatrix.getMatrix().data());
@@ -1396,12 +1479,18 @@ void CHyprOpenGLImpl::renderTextureInternalWithDamage(SP<CTexture> tex, const CB
         glUniform1f(shader->roundingPower, roundingPower);
 
         if (allowDim && m_RenderData.currentWindow) {
-            glUniform1i(shader->applyTint, 1);
-            const auto DIM = m_RenderData.currentWindow->m_fDimPercent->value();
-            glUniform3f(shader->tint, 1.f - DIM, 1.f - DIM, 1.f - DIM);
-        } else {
+            if (m_RenderData.currentWindow->m_notRespondingTint->value() > 0) {
+                const auto DIM = m_RenderData.currentWindow->m_notRespondingTint->value();
+                glUniform1i(shader->applyTint, 1);
+                glUniform3f(shader->tint, 1.f - DIM, 1.f - DIM, 1.f - DIM);
+            } else if (m_RenderData.currentWindow->m_fDimPercent->value() > 0) {
+                glUniform1i(shader->applyTint, 1);
+                const auto DIM = m_RenderData.currentWindow->m_fDimPercent->value();
+                glUniform3f(shader->tint, 1.f - DIM, 1.f - DIM, 1.f - DIM);
+            } else
+                glUniform1i(shader->applyTint, 0);
+        } else
             glUniform1i(shader->applyTint, 0);
-        }
     }
 
     const float verts[] = {
@@ -1942,8 +2031,6 @@ void CHyprOpenGLImpl::renderTextureWithBlur(SP<CTexture> tex, const CBox& box, f
                                             float blurA, float overallA) {
     RASSERT(m_RenderData.pMonitor, "Tried to render texture with blur without begin()!");
 
-    static auto PNOBLUROVERSIZED = CConfigValue<Hyprlang::INT>("decoration:no_blur_on_oversized");
-
     TRACY_GPU_ZONE("RenderTextureWithBlur");
 
     // make a damage region for this window
@@ -1960,11 +2047,6 @@ void CHyprOpenGLImpl::renderTextureWithBlur(SP<CTexture> tex, const CBox& box, f
 
     m_RenderData.renderModif.applyToRegion(texDamage);
 
-    if (*PNOBLUROVERSIZED && m_RenderData.primarySurfaceUVTopLeft != Vector2D(-1, -1)) {
-        renderTexture(tex, box, a, round, roundingPower, false, true);
-        return;
-    }
-
     // amazing hack: the surface has an opaque region!
     CRegion inverseOpaque;
     if (a >= 1.f && std::round(pSurface->current.size.x * m_RenderData.pMonitor->scale) == box.w && std::round(pSurface->current.size.y * m_RenderData.pMonitor->scale) == box.h) {
@@ -1976,9 +2058,8 @@ void CHyprOpenGLImpl::renderTextureWithBlur(SP<CTexture> tex, const CBox& box, f
             renderTexture(tex, box, a, round, roundingPower, false, true);
             return;
         }
-    } else {
+    } else
         inverseOpaque = {0, 0, box.width, box.height};
-    }
 
     inverseOpaque.scale(m_RenderData.pMonitor->scale);
 
@@ -2825,11 +2906,11 @@ std::vector<SDRMFormat> CHyprOpenGLImpl::getDRMFormats() {
     return drmFormats;
 }
 
-SP<CEGLSync> CHyprOpenGLImpl::createEGLSync(CFileDescriptor fenceFD) {
+SP<CEGLSync> CHyprOpenGLImpl::createEGLSync(int fenceFD) {
     std::vector<EGLint> attribs;
     CFileDescriptor     dupFd;
-    if (fenceFD.isValid()) {
-        dupFd = fenceFD.duplicate();
+    if (fenceFD >= 0) {
+        dupFd = CFileDescriptor{fcntl(fenceFD, F_DUPFD_CLOEXEC, 0)};
         if (!dupFd.isValid()) {
             Debug::log(ERR, "createEGLSync: dup failed");
             return nullptr;
@@ -2861,27 +2942,6 @@ SP<CEGLSync> CHyprOpenGLImpl::createEGLSync(CFileDescriptor fenceFD) {
     eglsync->sync  = sync;
     eglsync->m_iFd = CFileDescriptor{fd};
     return eglsync;
-}
-
-bool CHyprOpenGLImpl::waitForTimelinePoint(SP<CSyncTimeline> timeline, uint64_t point) {
-    auto fd = timeline->exportAsSyncFileFD(point);
-    if (!fd.isValid()) {
-        Debug::log(ERR, "waitForTimelinePoint: failed to get a fd from explicit timeline");
-        return false;
-    }
-
-    auto sync = g_pHyprOpenGL->createEGLSync(std::move(fd));
-    if (!sync) {
-        Debug::log(ERR, "waitForTimelinePoint: failed to get an eglsync from explicit timeline");
-        return false;
-    }
-
-    if (!sync->wait()) {
-        Debug::log(ERR, "waitForTimelinePoint: failed to wait on an eglsync from explicit timeline");
-        return false;
-    }
-
-    return true;
 }
 
 void SRenderModifData::applyToBox(CBox& box) {
@@ -2953,17 +3013,10 @@ CEGLSync::~CEGLSync() {
         Debug::log(ERR, "eglDestroySyncKHR failed");
 }
 
-CFileDescriptor& CEGLSync::fd() {
-    return m_iFd;
+CFileDescriptor&& CEGLSync::takeFD() {
+    return std::move(m_iFd);
 }
 
-bool CEGLSync::wait() {
-    if (sync == EGL_NO_SYNC_KHR)
-        return false;
-
-    if (g_pHyprOpenGL->m_sProc.eglWaitSyncKHR(g_pHyprOpenGL->m_pEglDisplay, sync, 0) != EGL_TRUE) {
-        Debug::log(ERR, "eglWaitSyncKHR failed");
-        return false;
-    }
-    return true;
+CFileDescriptor& CEGLSync::fd() {
+    return m_iFd;
 }

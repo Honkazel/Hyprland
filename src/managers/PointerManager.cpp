@@ -17,6 +17,9 @@
 #include <cstring>
 #include <gbm.h>
 #include <cairo/cairo.h>
+#include <hyprutils/utils/ScopeGuard.hpp>
+
+using namespace Hyprutils::Utils;
 
 CPointerManager::CPointerManager() {
     hooks.monitorAdded = g_pHookSystem->hookDynamic("monitorAdded", [this](void* self, SCallbackInfo& info, std::any data) {
@@ -271,7 +274,7 @@ void CPointerManager::updateCursorBackend() {
             continue;
         }
 
-        if (state->softwareLocks > 0 || g_pConfigManager->shouldUseSoftwareCursors() || !attemptHardwareCursor(state)) {
+        if (state->softwareLocks > 0 || g_pConfigManager->shouldUseSoftwareCursors(m) || !attemptHardwareCursor(state)) {
             Debug::log(TRACE, "Output {} rejected hardware cursors, falling back to sw", m->szName);
             state->box            = getCursorBoxLogicalForMonitor(state->monitor.lock());
             state->hardwareFailed = true;
@@ -310,7 +313,12 @@ void CPointerManager::onCursorMoved() {
             recalc = true;
         }
 
-        if (state->hardwareFailed || !state->entered)
+        if (!state->entered)
+            continue;
+
+        CScopeGuard x([m] { m->onCursorMovedOnMonitor(); });
+
+        if (state->hardwareFailed)
             continue;
 
         const auto CURSORPOS = getCursorPosForMonitor(m);
@@ -411,7 +419,9 @@ SP<Aquamarine::IBuffer> CPointerManager::renderHWCursorBuffer(SP<CPointerManager
                 }
             }
 
-            state->monitor->cursorSwapchain = Aquamarine::CSwapchain::create(allocator, state->monitor->output->getBackend());
+            auto backend                    = state->monitor->output->getBackend();
+            auto primary                    = backend->getPrimary();
+            state->monitor->cursorSwapchain = Aquamarine::CSwapchain::create(allocator, primary ? primary.lock() : backend);
         }
 
         auto options     = state->monitor->cursorSwapchain->currentOptions();
@@ -729,7 +739,8 @@ void CPointerManager::damageIfSoftware() {
         if (mw->monitor.expired() || !mw->monitor->output)
             continue;
 
-        if ((mw->softwareLocks > 0 || mw->hardwareFailed || g_pConfigManager->shouldUseSoftwareCursors()) && b.overlaps({mw->monitor->vecPosition, mw->monitor->vecSize})) {
+        if ((mw->softwareLocks > 0 || mw->hardwareFailed || g_pConfigManager->shouldUseSoftwareCursors(mw->monitor.lock())) &&
+            b.overlaps({mw->monitor->vecPosition, mw->monitor->vecSize})) {
             g_pHyprRenderer->damageBox(b, mw->monitor->shouldSkipScheduleFrameOnMouseEvent());
             break;
         }

@@ -25,8 +25,8 @@ class CCompositor {
     CCompositor(bool onlyConfig = false);
     ~CCompositor();
 
-    wl_display*                                m_sWLDisplay;
-    wl_event_loop*                             m_sWLEventLoop;
+    wl_display*                                m_sWLDisplay   = nullptr;
+    wl_event_loop*                             m_sWLEventLoop = nullptr;
     int                                        m_iDRMFD       = -1;
     bool                                       m_bInitialized = false;
     SP<Aquamarine::CBackend>                   m_pAqBackend;
@@ -147,12 +147,12 @@ class CCompositor {
     void                   setPreferredTransformForSurface(SP<CWLSurfaceResource> pSurface, wl_output_transform transform);
     void                   updateSuspendedStates();
     void                   onNewMonitor(SP<Aquamarine::IOutput> output);
-    void                   ensurePersistentWorkspacesPresent(const std::vector<SWorkspaceRule>& rules);
+    void                   ensurePersistentWorkspacesPresent(const std::vector<SWorkspaceRule>& rules, PHLWORKSPACE pWorkspace = nullptr);
 
-    SImageDescription      getPreferredImageDescription();
-    bool                   shouldChangePreferredImageDescription();
+    NColorManagement::SImageDescription getPreferredImageDescription();
+    bool                                shouldChangePreferredImageDescription();
 
-    std::string            explicitConfigPath;
+    std::string                         explicitConfigPath;
 
   private:
     void             initAllSignals();
